@@ -1,5 +1,5 @@
 use crate::{
-    clock, errors::InsufficientCapacity, middleware::RateLimitingMiddleware,
+    clock, decision::Decision, errors::InsufficientCapacity, middleware::RateLimitingMiddleware,
     state::keyed::KeyedStateStore, Jitter, NotUntil, RateLimiter,
 };
 use core::{hash::Hash, num::NonZeroU32};
@@ -96,6 +96,56 @@ where
                     delay.await;
                 }
             }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+/// # Keyed rate limiters - `async`/`await` with structured decisions
+impl<K, S, C, MW> RateLimiter<K, S, C, MW>
+where
+    K: Hash + Eq + Clone,
+    S: KeyedStateStore<K>,
+    C: clock::ReasonablyRealtime,
+    MW: RateLimitingMiddleware<C::Instant>,
+{
+    /// Asynchronously resolves as soon as a single cell for the given key is
+    /// allowed, returning the [`Decision`] that allowed it.
+    ///
+    /// This is the structured-evidence equivalent of
+    /// [`RateLimiter::until_key_ready`]: the returned decision is the result of the
+    /// single, final state transition. Rejected attempts while waiting consume
+    /// nothing and never produce evidence - only their retry time is used to wait.
+    pub async fn until_key_decision_ready(&self, key: &K) -> Decision<C::Instant> {
+        loop {
+            let decision = self.decide_key(key);
+            if decision.is_allowed() {
+                return decision;
+            }
+            let delay = Delay::new(decision.wait_time_from(self.clock.now()));
+            delay.await;
+        }
+    }
+
+    /// Asynchronously resolves as soon as `n` cells for the given key are allowed,
+    /// returning the [`Decision`] that allowed them.
+    ///
+    /// This is the structured-evidence equivalent of
+    /// [`RateLimiter::until_key_n_ready`]. Returns [`InsufficientCapacity`]
+    /// (without any state change) if `n` can never fit within the quota's burst
+    /// size.
+    pub async fn until_key_n_decision_ready(
+        &self,
+        key: &K,
+        n: NonZeroU32,
+    ) -> Result<Decision<C::Instant>, InsufficientCapacity> {
+        loop {
+            let decision = self.decide_key_n(key, n)?;
+            if decision.is_allowed() {
+                return Ok(decision);
+            }
+            let delay = Delay::new(decision.wait_time_from(self.clock.now()));
+            delay.await;
         }
     }
 }

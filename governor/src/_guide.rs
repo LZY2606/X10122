@@ -80,6 +80,49 @@
 //! lim.check_key(&"cus_2").unwrap(); // another!
 //! ```
 //!
+//! # Getting structured evidence for a decision
+//!
+//! Sometimes a bare `Ok(())` / `Err(...)` is not enough: callers want to
+//! hand the upper layers a record of *when* a request was judged, *how
+//! many* cells it asked for, *how much* capacity is left and, when a
+//! request had to wait, *when* it might succeed - along with the quota
+//! configuration that produced all of these numbers.
+//!
+//! The `decide` family of methods ([`RateLimiter::decide`],
+//! [`RateLimiter::decide_n`], [`RateLimiter::decide_key`] and
+//! [`RateLimiter::decide_key_n`], plus their `async` counterparts
+//! `until_decision_ready` / `until_n_decision_ready` /
+//! `until_key_decision_ready` / `until_key_n_decision_ready`) takes
+//! exactly the same decision as the equivalent `check` methods, but
+//! returns a [`Decision`][crate::Decision] object describing every
+//! detail of that one decision:
+//!
+//! ```rust
+//! # #[cfg(feature = "std")] fn main() {
+//! # use nonzero_ext::*;
+//! # use governor::{Quota, RateLimiter};
+//! let lim = RateLimiter::direct(Quota::per_second(nonzero!(20u32)));
+//! let d = lim.decide();
+//! assert_eq!(d.num_cells().get(), 1);
+//! assert_eq!(d.remaining_burst_capacity(), 19);
+//! assert_eq!(d.quota().burst_size().get(), 20);
+//! assert!(d.retry_after().is_none());
+//!
+//! // A rejected request records when it could conform, but consumes nothing:
+//! for _ in 0..19 { lim.decide(); }
+//! let rejected = lim.decide();
+//! assert!(rejected.is_rejected());
+//! assert!(rejected.retry_after().is_some());
+//! # } #[cfg(not(feature = "std"))] fn main() {}
+//! ```
+//!
+//! Unlike querying the limiter before and after a request (which can
+//! observe different instants under concurrency), every field of a
+//! `Decision` comes from the single GCRA state transition of that call:
+//! rejected requests advance no state at all, and compare-and-swap
+//! retries on keyed state stores never leak evidence from failed
+//! attempts.
+//!
 //! You can supply your own keyed state store implementation if you
 //! wish. That requires implementing the
 //! [KeyedStateStore][crate::state::keyed::KeyedStateStore] trait, and optionally the

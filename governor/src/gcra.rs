@@ -1,3 +1,4 @@
+use crate::decision::Decision;
 use crate::state::StateStore;
 use crate::InsufficientCapacity;
 use crate::{clock, middleware::StateSnapshot, Quota};
@@ -174,6 +175,76 @@ impl Gcra {
                 ))
             }
         }))
+    }
+
+    /// Tests a single cell and returns the full, structured evidence of the decision.
+    ///
+    /// This performs exactly the same state transition as [`Gcra::test_and_update`],
+    /// but instead of invoking middleware it returns a [`Decision`] describing every
+    /// fact about the transition (including, on rejection, when a retry could
+    /// conform). Rejected requests never advance the GCRA state, and compare-and-swap
+    /// retries inside the state store only return the evidence of the transition that
+    /// actually happened.
+    pub(crate) fn decide<K, P: clock::Reference, S: StateStore<Key = K>>(
+        &self,
+        start: P,
+        key: &K,
+        state: &S,
+        t0: P,
+    ) -> Decision<P> {
+        self.decide_n(start, key, NonZeroU32::MIN, state, t0)
+            .expect("a single cell always fits within the quota's burst size")
+    }
+
+    /// Tests whether all `n` cells could be accommodated and returns the structured
+    /// evidence of the decision, advancing the state only if they can.
+    ///
+    /// It has exactly the same error boundary as [`Gcra::test_n_all_and_update`]:
+    /// requests larger than the quota's burst size return
+    /// [`InsufficientCapacity`] without touching the state.
+    pub(crate) fn decide_n<K, P: clock::Reference, S: StateStore<Key = K>>(
+        &self,
+        start: P,
+        key: &K,
+        n: NonZeroU32,
+        state: &S,
+        t0: P,
+    ) -> Result<Decision<P>, InsufficientCapacity> {
+        let t0_offset = t0.duration_since(start);
+        let tau = self.tau;
+        let t = self.t;
+        let additional_weight = t * (n.get() - 1) as u64;
+
+        // Keep the "batch can never conform" error boundary identical to
+        // `test_n_all_and_update`: this check happens before any state access.
+        if additional_weight > tau {
+            return Err(InsufficientCapacity(
+                1 + (self.tau.as_u64() / t.as_u64()) as u32,
+            ));
+        }
+
+        // A rejection is represented by the `Err(Decision)` produced by the
+        // closure, which deliberately leaves the state untouched (the state
+        // store only installs the returned state for `Ok` outcomes).
+        let decision = state.measure_and_replace(key, |tat| {
+            let tat = tat.unwrap_or(t0_offset);
+            let earliest_time = (tat + additional_weight).saturating_sub(tau);
+            if t0_offset < earliest_time {
+                Err(Decision::reject(
+                    t0,
+                    n,
+                    StateSnapshot::new(t, tau, earliest_time, earliest_time),
+                    start,
+                ))
+            } else {
+                let next = cmp::max(tat, t0_offset) + t + additional_weight;
+                Ok((
+                    Decision::allow(t0, n, StateSnapshot::new(t, tau, t0_offset, next), start),
+                    next,
+                ))
+            }
+        });
+        Ok(decision.unwrap_or_else(|rejected: Decision<P>| rejected))
     }
 }
 

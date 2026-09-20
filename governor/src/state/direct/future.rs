@@ -3,6 +3,7 @@ use std::num::NonZeroU32;
 use super::RateLimiter;
 use crate::{
     clock,
+    decision::Decision,
     errors::InsufficientCapacity,
     middleware::RateLimitingMiddleware,
     state::{DirectStateStore, NotKeyed},
@@ -93,6 +94,54 @@ where
                     delay.await;
                 }
             }
+        }
+    }
+}
+
+/// # Direct rate limiters - `async`/`await` with structured decisions
+#[cfg(feature = "std")]
+impl<S, C, MW> RateLimiter<NotKeyed, S, C, MW>
+where
+    S: DirectStateStore,
+    C: clock::ReasonablyRealtime,
+    MW: RateLimitingMiddleware<C::Instant>,
+{
+    /// Asynchronously resolves as soon as a single cell is allowed, returning the
+    /// [`Decision`] that allowed it.
+    ///
+    /// This is the structured-evidence equivalent of [`RateLimiter::until_ready`]:
+    /// it shares its waiting behavior, but the returned decision is the result of
+    /// the single, final state transition. Rejected attempts made while waiting
+    /// consume nothing and only contribute their (non-blocking) retry time to the
+    /// wait; their evidence is not returned.
+    pub async fn until_decision_ready(&self) -> Decision<C::Instant> {
+        loop {
+            let decision = self.decide();
+            if decision.is_allowed() {
+                return decision;
+            }
+            let delay = Delay::new(decision.wait_time_from(self.clock.now()));
+            delay.await;
+        }
+    }
+
+    /// Asynchronously resolves as soon as `n` cells are allowed, returning the
+    /// [`Decision`] that allowed them.
+    ///
+    /// This is the structured-evidence equivalent of
+    /// [`RateLimiter::until_n_ready`]. Returns [`InsufficientCapacity`] (without
+    /// any state change) if `n` can never fit within the quota's burst size.
+    pub async fn until_n_decision_ready(
+        &self,
+        n: NonZeroU32,
+    ) -> Result<Decision<C::Instant>, InsufficientCapacity> {
+        loop {
+            let decision = self.decide_n(n)?;
+            if decision.is_allowed() {
+                return Ok(decision);
+            }
+            let delay = Delay::new(decision.wait_time_from(self.clock.now()));
+            delay.await;
         }
     }
 }

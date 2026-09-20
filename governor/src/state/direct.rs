@@ -7,6 +7,7 @@ use core::num::NonZeroU32;
 
 use crate::{
     clock,
+    decision::Decision,
     errors::InsufficientCapacity,
     middleware::{NoOpMiddleware, RateLimitingMiddleware},
     state::InMemoryState,
@@ -105,6 +106,83 @@ where
                 &self.state,
                 self.clock.now(),
             )
+    }
+
+    /// Make a rate-limiting decision for a single cell and return its full evidence.
+    ///
+    /// This takes exactly the same decision as [`RateLimiter::check`] - it advances
+    /// the rate limiter's state exactly once when the cell is allowed and not at all
+    /// when it is rejected - but instead of a bare `Result`, it returns a
+    /// [`Decision`] recording the decision time, the requested cell count, the quota
+    /// used, the remaining burst capacity and, on rejection, the earliest time at
+    /// which a request could conform.
+    ///
+    /// All fields are derived from the same GCRA state transition, so they remain
+    /// mutually consistent even under concurrency or with a custom clock that stands
+    /// still or moves backwards.
+    ///
+    /// # Example
+    /// ```rust
+    /// # #[cfg(feature = "std")]
+    /// # fn main() {
+    /// use governor::{Quota, RateLimiter};
+    /// use nonzero_ext::nonzero;
+    ///
+    /// let lim = RateLimiter::direct(Quota::per_second(nonzero!(5u32)));
+    /// let decision = lim.decide();
+    /// assert!(decision.is_allowed());
+    /// assert_eq!(decision.num_cells().get(), 1);
+    /// assert_eq!(decision.remaining_burst_capacity(), 4);
+    /// # }
+    /// # #[cfg(not(feature = "std"))]
+    /// # fn main() {}
+    /// ```
+    pub fn decide(&self) -> Decision<C::Instant> {
+        self.gcra.decide::<NotKeyed, C::Instant, S>(
+            self.start,
+            &NotKeyed::NonKey,
+            &self.state,
+            self.clock.now(),
+        )
+    }
+
+    /// Make a rate-limiting decision for `n` cells and return its full evidence.
+    ///
+    /// This takes exactly the same decision as [`RateLimiter::check_n`] and shares
+    /// its two failure modes:
+    /// * If all `n` cells can be accommodated, the returned [`Decision`] reports an
+    ///   allowed outcome and the capacity remaining after deducting all `n` cells.
+    /// * If not all cells can make it through right now, the returned [`Decision`]
+    ///   reports a rejected outcome and the earliest time at which the batch might
+    ///   conform; no cells are consumed.
+    /// * If the batch can *never* go through, `Err(`[`InsufficientCapacity`]`)` is
+    ///   returned and the state is left untouched.
+    ///
+    /// # Example
+    /// ```rust
+    /// # #[cfg(feature = "std")]
+    /// # fn main() {
+    /// use governor::{Quota, RateLimiter};
+    /// use nonzero_ext::nonzero;
+    ///
+    /// let lim = RateLimiter::direct(Quota::per_second(nonzero!(5u32)));
+    /// let decision = lim.decide_n(nonzero!(3u32)).unwrap();
+    /// assert!(decision.is_allowed());
+    /// assert_eq!(decision.num_cells().get(), 3);
+    /// assert_eq!(decision.remaining_burst_capacity(), 2);
+    /// assert!(lim.decide_n(nonzero!(10u32)).is_err());
+    /// # }
+    /// # #[cfg(not(feature = "std"))]
+    /// # fn main() {}
+    /// ```
+    pub fn decide_n(&self, n: NonZeroU32) -> Result<Decision<C::Instant>, InsufficientCapacity> {
+        self.gcra.decide_n::<NotKeyed, C::Instant, S>(
+            self.start,
+            &NotKeyed::NonKey,
+            n,
+            &self.state,
+            self.clock.now(),
+        )
     }
 }
 

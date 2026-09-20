@@ -14,6 +14,7 @@ use core::prelude::v1::*;
 use crate::state::StateStore;
 use crate::{
     clock::{self, Reference},
+    decision::Decision,
     errors::InsufficientCapacity,
     middleware::RateLimitingMiddleware,
     nanos::Nanos,
@@ -177,6 +178,76 @@ where
             &self.state,
             self.clock.now(),
         )
+    }
+
+    /// Make a rate-limiting decision for a single cell of the given key and return
+    /// its full evidence.
+    ///
+    /// This takes exactly the same decision as [`RateLimiter::check_key`] - it
+    /// advances the key's GCRA state exactly once when the cell is allowed and not
+    /// at all when it is rejected - but returns a [`Decision`] recording the
+    /// decision time, the requested cell count, the quota used, the remaining burst
+    /// capacity and, on rejection, the earliest conforming retry time.
+    ///
+    /// Concurrent decisions on the same key rely on compare-and-swap; only the
+    /// evidence of the transition that actually happens is returned. Evidence from
+    /// failed attempts is discarded, so a single call results in at most one state
+    /// transition.
+    ///
+    /// # Example
+    /// ```rust
+    /// # #[cfg(feature = "std")]
+    /// # fn main() {
+    /// use governor::{Quota, RateLimiter};
+    /// use nonzero_ext::nonzero;
+    ///
+    /// let lim = RateLimiter::keyed(Quota::per_second(nonzero!(5u32)));
+    /// let decision = lim.decide_key(&"customer");
+    /// assert!(decision.is_allowed());
+    /// assert_eq!(decision.remaining_burst_capacity(), 4);
+    /// # }
+    /// # #[cfg(not(feature = "std"))]
+    /// # fn main() {}
+    /// ```
+    pub fn decide_key(&self, key: &K) -> Decision<C::Instant> {
+        self.gcra
+            .decide::<K, C::Instant, S>(self.start, key, &self.state, self.clock.now())
+    }
+
+    /// Make a rate-limiting decision for `n` cells of the given key and return its
+    /// full evidence.
+    ///
+    /// This takes exactly the same decision as [`RateLimiter::check_key_n`]: if the
+    /// batch can never fit within the quota's burst size, it returns
+    /// [`InsufficientCapacity`] without touching the key's state; if it does not
+    /// conform right now, the returned [`Decision`] reports a rejection and the
+    /// earliest retry time without consuming cells; otherwise it reports an allowed
+    /// outcome and the remaining capacity.
+    ///
+    /// # Example
+    /// ```rust
+    /// # #[cfg(feature = "std")]
+    /// # fn main() {
+    /// use governor::{Quota, RateLimiter};
+    /// use nonzero_ext::nonzero;
+    ///
+    /// let lim = RateLimiter::keyed(Quota::per_second(nonzero!(5u32)));
+    /// let decision = lim.decide_key_n(&"customer", nonzero!(3u32)).unwrap();
+    /// assert!(decision.is_allowed());
+    /// assert_eq!(decision.num_cells().get(), 3);
+    /// assert_eq!(decision.remaining_burst_capacity(), 2);
+    /// assert!(lim.decide_key_n(&"customer", nonzero!(10u32)).is_err());
+    /// # }
+    /// # #[cfg(not(feature = "std"))]
+    /// # fn main() {}
+    /// ```
+    pub fn decide_key_n(
+        &self,
+        key: &K,
+        n: NonZeroU32,
+    ) -> Result<Decision<C::Instant>, InsufficientCapacity> {
+        self.gcra
+            .decide_n::<K, C::Instant, S>(self.start, key, n, &self.state, self.clock.now())
     }
 }
 

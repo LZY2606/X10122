@@ -39,6 +39,7 @@ extern crate alloc;
 
 pub mod r#_guide;
 pub mod clock;
+pub mod decision;
 mod errors;
 mod gcra;
 #[cfg(any(feature = "std", feature = "jitter"))]
@@ -48,6 +49,7 @@ pub mod nanos;
 mod quota;
 pub mod state;
 
+pub use decision::Decision;
 pub use errors::*;
 pub use gcra::NotUntil;
 #[cfg(feature = "jitter")]
