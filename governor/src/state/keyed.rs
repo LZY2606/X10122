@@ -17,7 +17,7 @@ use crate::{
     errors::InsufficientCapacity,
     middleware::RateLimitingMiddleware,
     nanos::Nanos,
-    Quota, RateLimiter,
+    Decision, Quota, RateLimiter,
 };
 
 #[cfg(feature = "std")]
@@ -171,6 +171,90 @@ where
         n: NonZeroU32,
     ) -> Result<Result<MW::PositiveOutcome, MW::NegativeOutcome>, InsufficientCapacity> {
         self.gcra.test_n_all_and_update::<K, C::Instant, S, MW>(
+            self.start,
+            key,
+            n,
+            &self.state,
+            self.clock.now(),
+        )
+    }
+
+    /// Allow a single cell through the rate limiter for the given key and
+    /// return a structured [`Decision`] describing the outcome.
+    ///
+    /// Unlike [`check_key`](#method.check_key), which only reports whether
+    /// the cell was allowed through, the returned [`Decision`] captures the
+    /// evidence of the verdict as observed at the moment of the decision:
+    /// the time the decision was made, the quota it was reached under, and
+    /// either the remaining burst capacity (if the cell was allowed) or the
+    /// earliest time a retry could be allowed (if it was not).
+    ///
+    /// All of this information is derived from the *same* state transition,
+    /// so concurrent decisions made by other threads (even for the same key)
+    /// can not skew the values relative to each other. A negative decision
+    /// never consumes any capacity.
+    ///
+    /// # Example
+    /// ```rust
+    /// # #[cfg(feature = "std")]
+    /// # fn main () {
+    /// use governor::{Quota, RateLimiter};
+    /// use nonzero_ext::nonzero;
+    ///
+    /// let lim = RateLimiter::keyed(Quota::per_second(nonzero!(1_u32)));
+    /// let decision = lim.check_key_with_decision(&"my-api-key");
+    /// assert!(decision.is_allowed());
+    /// assert_eq!(decision.remaining_burst_capacity(), Some(0));
+    ///
+    /// let decision = lim.check_key_with_decision(&"my-api-key");
+    /// assert!(!decision.is_allowed());
+    /// assert!(decision.retry_at().is_some());
+    /// # }
+    /// # #[cfg(not(feature = "std"))]
+    /// # fn main() {}
+    /// ```
+    pub fn check_key_with_decision(&self, key: &K) -> Decision<C::Instant> {
+        self.gcra
+            .test_and_update_decision(self.start, key, &self.state, self.clock.now())
+    }
+
+    /// Allow *only all* `n` cells through the rate limiter for the given key
+    /// and return a structured [`Decision`] describing the outcome.
+    ///
+    /// This behaves exactly like [`check_key_n`](#method.check_key_n), but
+    /// reports the outcome as a [`Decision`]: If all `n` cells can be
+    /// accommodated, the decision is positive and reports the remaining
+    /// burst capacity; otherwise it is negative and reports the earliest
+    /// time the batch could conform. As with `check_key_n`, if the batch
+    /// can never conform because it exceeds the quota's burst size, this
+    /// returns [`InsufficientCapacity`].
+    ///
+    /// # Example
+    /// ```rust
+    /// # #[cfg(feature = "std")]
+    /// # fn main () {
+    /// use governor::{Quota, RateLimiter};
+    /// use nonzero_ext::nonzero;
+    ///
+    /// let lim = RateLimiter::keyed(
+    ///     Quota::per_second(nonzero!(1_u32)).allow_burst(nonzero!(4_u32)),
+    /// );
+    /// let decision = lim
+    ///     .check_key_n_with_decision(&"my-api-key", nonzero!(3_u32))
+    ///     .unwrap();
+    /// assert!(decision.is_allowed());
+    /// assert_eq!(decision.cells(), nonzero!(3_u32));
+    /// assert_eq!(decision.remaining_burst_capacity(), Some(1));
+    /// # }
+    /// # #[cfg(not(feature = "std"))]
+    /// # fn main() {}
+    /// ```
+    pub fn check_key_n_with_decision(
+        &self,
+        key: &K,
+        n: NonZeroU32,
+    ) -> Result<Decision<C::Instant>, InsufficientCapacity> {
+        self.gcra.test_n_all_and_update_decision(
             self.start,
             key,
             n,

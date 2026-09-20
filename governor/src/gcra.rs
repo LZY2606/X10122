@@ -1,10 +1,12 @@
 use crate::state::StateStore;
 use crate::InsufficientCapacity;
+use crate::Decision;
 use crate::{clock, middleware::StateSnapshot, Quota};
 use crate::{middleware::RateLimitingMiddleware, nanos::Nanos};
 use core::num::NonZeroU32;
 use core::time::Duration;
 use core::{cmp, fmt};
+use nonzero_ext::nonzero;
 
 #[cfg(feature = "std")]
 use crate::Jitter;
@@ -174,6 +176,92 @@ impl Gcra {
                 ))
             }
         }))
+    }
+
+    /// Tests a single cell against the rate limiter state, updates it, and
+    /// returns a structured [`Decision`] describing the outcome.
+    ///
+    /// This performs exactly one state transition (or, for negative
+    /// outcomes, one observation of the state): All the information in the
+    /// returned `Decision` is derived from the same measurement.
+    pub(crate) fn test_and_update_decision<K, P: clock::Reference, S: StateStore<Key = K>>(
+        &self,
+        start: P,
+        key: &K,
+        state: &S,
+        t0: P,
+    ) -> Decision<P> {
+        let t0_relative = t0.duration_since(start);
+        let tau = self.tau;
+        let t = self.t;
+        let quota = Quota::from_gcra_parameters(t, tau);
+        let cell = nonzero!(1u32);
+        match state.measure_and_replace(key, |tat| {
+            let tat = tat.unwrap_or(t0_relative);
+            let earliest_time = tat.saturating_sub(tau);
+            if t0_relative < earliest_time {
+                Err(Decision::denied(quota, cell, t0, start + earliest_time))
+            } else {
+                let next = cmp::max(tat, t0_relative) + t;
+                let snapshot = StateSnapshot::new(t, tau, t0_relative, next);
+                Ok((
+                    Decision::allowed(quota, cell, t0, snapshot.remaining_burst_capacity()),
+                    next,
+                ))
+            }
+        }) {
+            Ok(decision) | Err(decision) => decision,
+        }
+    }
+
+    /// Tests whether all `n` cells can be accommodated, updates the rate
+    /// limiter state if so, and returns a structured [`Decision`] describing
+    /// the outcome.
+    ///
+    /// Like [`test_n_all_and_update`][Gcra::test_n_all_and_update], this
+    /// returns [`InsufficientCapacity`] if the batch can never conform to
+    /// the quota's burst size.
+    pub(crate) fn test_n_all_and_update_decision<
+        K,
+        P: clock::Reference,
+        S: StateStore<Key = K>,
+    >(
+        &self,
+        start: P,
+        key: &K,
+        n: NonZeroU32,
+        state: &S,
+        t0: P,
+    ) -> Result<Decision<P>, InsufficientCapacity> {
+        let t0_relative = t0.duration_since(start);
+        let tau = self.tau;
+        let t = self.t;
+        let quota = Quota::from_gcra_parameters(t, tau);
+        let additional_weight = t * (n.get() - 1) as u64;
+
+        // Check that we can allow enough cells through. Note that both `additional_weight` and
+        // `tau` represent the value of the cells *in addition* to the first cell.
+        if additional_weight > tau {
+            return Err(InsufficientCapacity(
+                1 + (self.tau.as_u64() / t.as_u64()) as u32,
+            ));
+        }
+        Ok(match state.measure_and_replace(key, |tat| {
+            let tat = tat.unwrap_or(t0_relative);
+            let earliest_time = (tat + additional_weight).saturating_sub(tau);
+            if t0_relative < earliest_time {
+                Err(Decision::denied(quota, n, t0, start + earliest_time))
+            } else {
+                let next = cmp::max(tat, t0_relative) + t + additional_weight;
+                let snapshot = StateSnapshot::new(t, tau, t0_relative, next);
+                Ok((
+                    Decision::allowed(quota, n, t0, snapshot.remaining_burst_capacity()),
+                    next,
+                ))
+            }
+        }) {
+            Ok(decision) | Err(decision) => decision,
+        })
     }
 }
 

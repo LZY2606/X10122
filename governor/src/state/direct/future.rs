@@ -6,7 +6,7 @@ use crate::{
     errors::InsufficientCapacity,
     middleware::RateLimitingMiddleware,
     state::{DirectStateStore, NotKeyed},
-    Jitter, NotUntil,
+    Decision, Jitter, NotUntil,
 };
 use futures_timer::Delay;
 
@@ -93,6 +93,72 @@ where
                     delay.await;
                 }
             }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+/// # Direct rate limiters - `async`/`await` with structured decisions
+impl<S, C, MW> RateLimiter<NotKeyed, S, C, MW>
+where
+    S: DirectStateStore,
+    C: clock::ReasonablyRealtime,
+    MW: RateLimitingMiddleware<C::Instant>,
+{
+    /// Asynchronously resolves with a structured [`Decision`] as soon as the
+    /// rate limiter allows it.
+    ///
+    /// This behaves like [`until_ready`](#method.until_ready), but resolves
+    /// to the [`Decision`] of the final, positive rate-limiting decision:
+    /// the same structured evidence that
+    /// [`check_with_decision`](struct.RateLimiter.html#method.check_with_decision)
+    /// returns.
+    ///
+    /// # Example
+    /// ```rust
+    /// # #[cfg(feature = "std")]
+    /// # fn main () {
+    /// use governor::{Quota, RateLimiter};
+    /// use nonzero_ext::nonzero;
+    ///
+    /// let lim = RateLimiter::direct(Quota::per_second(nonzero!(1_u32)));
+    /// let decision = futures_executor::block_on(lim.until_ready_with_decision());
+    /// assert!(decision.is_allowed());
+    /// # }
+    /// # #[cfg(not(feature = "std"))]
+    /// # fn main() {}
+    /// ```
+    pub async fn until_ready_with_decision(&self) -> Decision<C::Instant> {
+        loop {
+            let decision = self.check_with_decision();
+            if decision.is_allowed() {
+                return decision;
+            }
+            let delay = Delay::new(decision.wait_time_from(self.clock.now()));
+            delay.await;
+        }
+    }
+
+    /// Asynchronously resolves with a structured [`Decision`] as soon as the
+    /// rate limiter allows `n` cells through.
+    ///
+    /// This behaves like [`until_n_ready`](#method.until_n_ready), but
+    /// resolves to the [`Decision`] of the final, positive rate-limiting
+    /// decision.
+    ///
+    /// Returns `InsufficientCapacity` if the `n` provided exceeds the maximum
+    /// capacity of the rate limiter.
+    pub async fn until_n_ready_with_decision(
+        &self,
+        n: NonZeroU32,
+    ) -> Result<Decision<C::Instant>, InsufficientCapacity> {
+        loop {
+            let decision = self.check_n_with_decision(n)?;
+            if decision.is_allowed() {
+                return Ok(decision);
+            }
+            let delay = Delay::new(decision.wait_time_from(self.clock.now()));
+            delay.await;
         }
     }
 }

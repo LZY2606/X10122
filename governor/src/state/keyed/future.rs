@@ -1,6 +1,6 @@
 use crate::{
     clock, errors::InsufficientCapacity, middleware::RateLimitingMiddleware,
-    state::keyed::KeyedStateStore, Jitter, NotUntil, RateLimiter,
+    state::keyed::KeyedStateStore, Decision, Jitter, NotUntil, RateLimiter,
 };
 use core::{hash::Hash, num::NonZeroU32};
 use futures_timer::Delay;
@@ -96,6 +96,75 @@ where
                     delay.await;
                 }
             }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+/// # Keyed rate limiters - `async`/`await` with structured decisions
+impl<K, S, C, MW> RateLimiter<K, S, C, MW>
+where
+    K: Hash + Eq + Clone,
+    S: KeyedStateStore<K>,
+    C: clock::ReasonablyRealtime,
+    MW: RateLimitingMiddleware<C::Instant>,
+{
+    /// Asynchronously resolves with a structured [`Decision`] as soon as the
+    /// rate limiter allows it for the given key.
+    ///
+    /// This behaves like [`until_key_ready`](#method.until_key_ready), but
+    /// resolves to the [`Decision`] of the final, positive rate-limiting
+    /// decision: the same structured evidence that
+    /// [`check_key_with_decision`](struct.RateLimiter.html#method.check_key_with_decision)
+    /// returns.
+    ///
+    /// # Example
+    /// ```rust
+    /// # #[cfg(feature = "std")]
+    /// # fn main () {
+    /// use governor::{Quota, RateLimiter};
+    /// use nonzero_ext::nonzero;
+    ///
+    /// let lim = RateLimiter::keyed(Quota::per_second(nonzero!(1_u32)));
+    /// let decision =
+    ///     futures_executor::block_on(lim.until_key_ready_with_decision(&"my-api-key"));
+    /// assert!(decision.is_allowed());
+    /// # }
+    /// # #[cfg(not(feature = "std"))]
+    /// # fn main() {}
+    /// ```
+    pub async fn until_key_ready_with_decision(&self, key: &K) -> Decision<C::Instant> {
+        loop {
+            let decision = self.check_key_with_decision(key);
+            if decision.is_allowed() {
+                return decision;
+            }
+            let delay = Delay::new(decision.wait_time_from(self.clock.now()));
+            delay.await;
+        }
+    }
+
+    /// Asynchronously resolves with a structured [`Decision`] as soon as the
+    /// rate limiter allows `n` cells through for the given key.
+    ///
+    /// This behaves like
+    /// [`until_key_n_ready`](#method.until_key_n_ready), but resolves to the
+    /// [`Decision`] of the final, positive rate-limiting decision.
+    ///
+    /// Returns `InsufficientCapacity` if the `n` provided exceeds the maximum
+    /// capacity of the rate limiter.
+    pub async fn until_key_n_ready_with_decision(
+        &self,
+        key: &K,
+        n: NonZeroU32,
+    ) -> Result<Decision<C::Instant>, InsufficientCapacity> {
+        loop {
+            let decision = self.check_key_n_with_decision(key, n)?;
+            if decision.is_allowed() {
+                return Ok(decision);
+            }
+            let delay = Delay::new(decision.wait_time_from(self.clock.now()));
+            delay.await;
         }
     }
 }
